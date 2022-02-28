@@ -1,36 +1,56 @@
-#!/usr/bin/python3
+#!/usr/bin/env python3
+# encoding:utf-8
 
 import sys
 import os
 import time
-import logging
 import hashlib
+import shutil
+import tempfile
+import re
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
+from pathlib import Path
+from jinja2 import Environment, BaseLoader
+
 
 class EventHandler(FileSystemEventHandler):
-    def __init__(self, *args, ignore=None, **kwargs):
+    def __init__(self, *args, base_path='', **kwargs):
         super().__init__(*args, **kwargs)
 
         self.file_change_list = {}
         self.folder_change_list = {}
+        self.base_path = base_path
 
     def is_ignored(self, src_path) -> bool:
-        if src_path in ('./sync.pipe', '.'):
+        ignore_list = [
+            r'mysync\.sh',
+            r'sync\.tar\.gz',
+            r'\..*',
+        ]
+
+        if src_path in ['.', '..', self.base_path]:
             return True
+
+        src_path = src_path.replace(self.base_path + '/', '')
+        for item in ignore_list:
+            if re.match(item, src_path) is not None:
+                return True
 
         return False
 
+    # using 'dcit' to do hash store
     def add_change(self, event):
+        if self.is_ignored(event.src_path):
+            return
+
         if event.is_directory:
             self.folder_change_list[event.src_path] = 'whatever'
         else:
             self.file_change_list[event.src_path] = 'whatever'
 
-
     def on_moved(self, event):
-        src_path = event.src_path
-        if self.is_ignored(src_path):
+        if self.is_ignored(event.src_path):
             return
 
         if event.is_directory:
@@ -42,133 +62,147 @@ class EventHandler(FileSystemEventHandler):
 
         super().on_moved(event)
 
-
     def on_created(self, event):
-        src_path = event.src_path
-        if self.is_ignored(src_path):
-            return
-
         # echo hello world > 1.txt, 1.txt will be create then modified
         self.add_change(event)
-
         super().on_created(event)
 
     def on_deleted(self, event):
-        src_path = event.src_path
-        if self.is_ignored(src_path):
-            return
-
         self.add_change(event)
-
         super().on_deleted(event)
 
-
     def on_modified(self, event):
-        src_path = event.src_path
-        if self.is_ignored(src_path):
-            return
-
-        self.add_change(event)
-
+        # for directory, ignore modified event
+        if not event.is_directory:
+            self.add_change(event)
         super().on_modified(event)
 
-def generate_snapshot(folder_change_list, file_change_list):
+    def _md5sum(self, f):
+        with open(f, 'rb') as rf:
+            file_content = rf.read()
+            rf.close()
+        m = hashlib.md5()
+        m.update(file_content)
+        return m.hexdigest()
 
-    extract_cmd = '''#!/bin/bash
-sed -e '1,/^%%FUCK%%$/d' $0| tar xjf - || exit 1
-'''
+    def generate_snapshot(self):
+        bash_script = '''
+#!/bin/bash
+# prepare
+mkdir .sync
+sed -e '1,/^%%HELLO%%$/d' $0 | tar xzf - -C .sync || exit 1
 
-    mkdir_cmd = '''
-if [ ! -d <replace> ]; then
-    echo mkdir -p <replace>
-    mkdir -p <replace>
+# sync folder first
+{% for folder,value in folders.items() %}
+{% if value['action'] == 'create_or_modify' %}
+if [ ! -d {{ folder }} ]; then
+    echo mkdir -p {{ folder }}
+    mkdir -p {{ folder }}
 fi
-'''
-    rm_cmd = '''
-if [ -e <replace> ]; then
-echo rm -rf <replace>
-rm -rf <replace>
+{% else %}
+if [ -e {{ folder }} ]; then
+echo rm -rf {{ folder }}
+rm -rf {{ folder }}
 fi
-'''
+{% endif %}
+{% endfor %}
 
-    write_file_cmd = '''
-echo cp <replace1> <replace2>
-cp <replace1> <replace2>
-    '''
+# then sync files
+{% for f,value in files.items() %}
+{% if value['action'] == 'create_or_modify' %}
+echo cp ./.sync/{{ value['extension'] }} {{ f }}
+cp ./.sync/{{ value['extension'] }} {{ f }}
+{% else %}
+if [ -e {{ f }} ]; then
+echo rm -rf {{ f }}
+rm -rf {{ f }}
+fi
+{% endif %}
+{% endfor %}
 
-    finish_cmd = '''
+# clean
+rm -rf ./.sync
 echo "sync done"
 exit 0
-%%FUCK%%
+# end marker
+%%HELLO%%
+
 '''
+        folder_change_list = self.folder_change_list
+        self.folder_change_list = {}
 
-    output = extract_cmd
+        folder_change_trim = {}
+        for folder in folder_change_list.keys():
+            if Path(folder).exists():
+                folder_change_trim[folder.replace(self.base_path, '.')] = {
+                    'action': 'create_or_modify',
+                    'extension': None
+                }
+            else:
+                folder_change_trim[folder.replace(self.base_path, '.')] = {
+                    'action': 'delete',
+                    'extension': None
+                }
 
-    for folder in folder_change_list.keys():
-        if os.path.exists(folder):
-            cmd = mkdir_cmd.replace('<replace>', folder)
-        else:
-            cmd = rm_cmd.replace('<replace>', folder)
+        for folder, v in folder_change_trim.items():
+            print("{}: {} folder".format(folder, v['action']))
 
-        output = output + cmd
+        file_change_trim = {}
+        with tempfile.TemporaryDirectory() as tmpdirname:
+            file_change_list = self.file_change_list
+            self.file_change_list = {}
 
-    for f in file_change_list.keys():
-        if os.path.exists(f):
-            with open(f, 'rb') as rf:
-                file_content = rf.read()
-                rf.close()
+            for f in file_change_list.keys():
+                if Path(f).exists():
+                    md5 = self._md5sum(f)
+                    shutil.copy(f, Path(tmpdirname, md5))
+                    file_change_trim[f.replace(self.base_path, '.')] = {
+                        'action': 'create_or_modify',
+                        'extension': md5
+                    }
+                else:
+                    file_change_trim[f.replace(self.base_path, '.')] = {
+                        'action': 'delete',
+                        'extension': None
+                    }
+            for f, v in file_change_trim.items():
+                print("{}: {} file".format(f, v['action']))
 
-            m = hashlib.md5()
-            m.update(file_content)
-            new_file = '.sync/' + m.hexdigest()
+            tar_file = Path(self.base_path, 'sync')
+            shutil.make_archive(tar_file, "gztar", tmpdirname)
 
-            with open(new_file, 'wb') as wf:
-                wf.write(file_content)
-                wf.close()
+        rtemplate = Environment(loader=BaseLoader).from_string(bash_script)
+        args = {"folders": folder_change_trim, "files": file_change_trim}
+        output = rtemplate.render(**args)
 
-            cmd = write_file_cmd.replace('<replace1>', new_file)
-            cmd = cmd.replace('<replace2>', f)
-        else:
-            cmd = rm_cmd.replace('<replace>', f)
+        return output
 
-        output = output + cmd
-    output = output + finish_cmd
-    return output
 
 if __name__ == "__main__":
-    print("server started")
-    if os.path.exists('./sync.pipe') is False:
-        os.system('mkfifo sync.pipe')
+    path = sys.argv[1] if len(sys.argv) > 1 else os.getcwd()
+    print("working directory is : " + path)
 
-    if os.path.exists('.sync'):
-        os.system('rm -rf .sync')
-    os.system('mkdir .sync')
-
-    logging.basicConfig(level=logging.INFO,
-                        format='%(asctime)s - %(message)s',
-                        datefmt='%Y-%m-%d %H:%M:%S')
-    path = sys.argv[1] if len(sys.argv) > 1 else '.'
-
-    event_handler = EventHandler()
+    event_handler = EventHandler(base_path=path)
     observer = Observer()
     observer.schedule(event_handler, path, recursive=True)
     observer.start()
+
     try:
         while True:
-            f = open('./sync.pipe', 'wb') # for pipe file, sleep here until another process read the pipe file
-            file_change_list = event_handler.file_change_list
-            folder_change_list = event_handler.folder_change_list
-            event_handler.file_change_list = {}
-            event_handler.folder_change_list = {}
-            output = generate_snapshot(folder_change_list, file_change_list)
-            os.system('tar cjf sync.tar.bz2 .sync')
-            f.write(output.encode(encoding="utf-8"))
-            #os.system('cat sync.tar.bz2 >> ./sync.pipe')
-            with open('sync.tar.bz2', 'rb') as tar:
+            print("\nPress Enter to generate sync shell script")
+            input()
+            shell_script = event_handler.generate_snapshot()
+            f = open('./mysync.sh', 'wb')
+            f.write(shell_script.encode(encoding="utf-8"))
+            tar_file = Path(path, 'sync.tar.gz')
+            with open(tar_file, 'rb') as tar:
                 f.write(tar.read())
                 tar.close()
             f.close()
+            os.remove(tar_file)
             time.sleep(1)
+            print("generate mysync.sh done")
     except KeyboardInterrupt:
         observer.stop()
     observer.join()
+
